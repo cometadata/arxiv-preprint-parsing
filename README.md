@@ -1,1 +1,1 @@
-# -arxiv-preprint-parsing
+# arxiv-preprint-parsing
