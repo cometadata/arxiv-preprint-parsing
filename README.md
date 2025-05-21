@@ -1,4 +1,4 @@
-# ArXiv Preprint Parsing
+# arXiv Preprint Parsing
 
 This is a COMET enrichment and curation workflow pilot project. Go to the [Pilot Projects Overview Board](https://github.com/orgs/cometadata/projects/14) to see all of the pilots.  
 
