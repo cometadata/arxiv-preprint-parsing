@@ -1,6 +1,6 @@
-# Author-Affiliation Parsing Benchmark Inference
+# LoRA Inference Author-Affiliation Parsing Benchmark
 
-Inference pipeline for extracting/benchmarking author affiliations from arXiv papers using vLLM on Modal.
+LoRA inference pipeline for extracting/benchmarking author affiliations from arXiv papers using vLLM on Modal.
 
 ## Usage
 
