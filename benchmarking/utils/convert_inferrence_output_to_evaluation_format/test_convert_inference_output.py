@@ -139,8 +139,8 @@ class TestProcessPredictedAuthors(unittest.TestCase):
         ]
         result = process_predicted_authors(input_authors)
         self.assertEqual(len(result), 2)
-        # Non-list affiliations should be converted to empty list
-        self.assertEqual(result[0]['affiliations'], [])
+        # String affiliations should become single-item lists
+        self.assertEqual(result[0]['affiliations'], ['MIT'])
         self.assertEqual(result[1]['affiliations'], [])
 
 
@@ -174,8 +174,7 @@ class TestConvertContentToPredictions(unittest.TestCase):
 
         # Write input file
         with open(self.input_file, 'w') as f:
-            for entry in input_data:
-                f.write(json.dumps(entry) + '\n')
+            json.dump(input_data, f)
 
         # Run conversion
         convert_content_to_predictions(
@@ -200,8 +199,7 @@ class TestConvertContentToPredictions(unittest.TestCase):
         ]
 
         with open(self.input_file, 'w') as f:
-            for entry in input_data:
-                f.write(json.dumps(entry) + '\n')
+            json.dump(input_data, f)
 
         convert_content_to_predictions(
             str(self.input_file), str(self.output_file))
@@ -241,8 +239,7 @@ class TestConvertContentToPredictions(unittest.TestCase):
         ]
 
         with open(self.input_file, 'w') as f:
-            for entry in input_data:
-                f.write(json.dumps(entry) + '\n')
+            json.dump(input_data, f)
 
         convert_content_to_predictions(
             str(self.input_file),
@@ -282,7 +279,7 @@ class TestConvertContentToPredictions(unittest.TestCase):
         error_calls = mock_logging.error.call_args_list
         self.assertTrue(any('parsing JSON' in str(call)
                             for call in error_calls))
-        self.assertTrue(any('missing arxiv_id' in str(call)
+        self.assertTrue(any('missing identifiable arxiv id fields' in str(call)
                             for call in error_calls))
 
     def test_empty_lines_handling(self):
@@ -317,8 +314,7 @@ class TestConvertContentToPredictions(unittest.TestCase):
         ]
 
         with open(self.input_file, 'w') as f:
-            for entry in input_data:
-                f.write(json.dumps(entry) + '\n')
+            json.dump(input_data, f)
 
         convert_content_to_predictions(
             str(self.input_file), str(self.output_file))
