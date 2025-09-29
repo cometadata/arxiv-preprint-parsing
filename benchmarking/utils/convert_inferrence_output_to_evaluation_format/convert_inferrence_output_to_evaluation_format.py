@@ -4,7 +4,7 @@ import logging
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, TypedDict
+from typing import Dict, List, Any, TypedDict, Optional, Tuple
 
 
 class Author(TypedDict):
@@ -13,39 +13,64 @@ class Author(TypedDict):
 
 
 def normalize_arxiv_id(arxiv_id: str) -> str:
-    match = re.search(r'(\d{4}\.\d{4,5}(v\d+)?|[a-z\-]+/\d{7}(v\d+)?)', arxiv_id, re.IGNORECASE)
+    if not arxiv_id:
+        return arxiv_id
+
+    cleaned = arxiv_id.strip()
+    if cleaned.lower().startswith('arxiv:'):
+        cleaned = cleaned[6:]
+
+    if '_' in cleaned and '/' not in cleaned:
+        prefix, suffix = cleaned.split('_', 1)
+        if prefix and suffix:
+            cleaned = f"{prefix}/{suffix}"
+
+    match = re.search(r'(\d{4}\.\d{4,5}(v\d+)?|[a-z\-]+/\d{7}(v\d+)?)', cleaned, re.IGNORECASE)
     if match:
         return match.group(1)
 
-    if arxiv_id.lower().startswith('arxiv:'):
-        return arxiv_id[6:]
-
-    return arxiv_id
+    return cleaned
 
 
-def process_predicted_authors(predicted_authors: Any, line_num: int = -1) -> List[Author]:
+def process_predicted_authors(
+    predicted_authors: Any,
+    line_num: int = -1,
+    context: Optional[str] = None,
+) -> List[Author]:
+    location = context or (f"Line {line_num}" if line_num != -1 else None)
+
     if predicted_authors is None:
         return []
 
     if not isinstance(predicted_authors, list):
-        if line_num != -1:
-            logging.warning(f"Line {line_num}: 'predicted_authors' is not a list, but type {type(predicted_authors).__name__}")
+        if location:
+            logging.warning(
+                f"{location}: 'predicted_authors' is not a list, but type {type(predicted_authors).__name__}"
+            )
         return []
 
     processed_authors: List[Author] = []
     for i, author in enumerate(predicted_authors):
         if not isinstance(author, dict):
-            if line_num != -1:
-                logging.warning(f"Line {line_num}: Author entry {i} is not a dict, skipping")
+            if location:
+                logging.warning(f"{location}: Author entry {i} is not a dict, skipping")
             continue
 
         if 'name' not in author or not author.get('name'):
-            if line_num != -1:
-                logging.warning(f"Line {line_num}: Author entry {i} is missing or has empty 'name', skipping")
+            if location:
+                logging.warning(
+                    f"{location}: Author entry {i} is missing or has empty 'name', skipping"
+                )
             continue
 
         affiliations = author.get('affiliations', [])
-        if not isinstance(affiliations, list):
+        if isinstance(affiliations, str):
+            affiliations = [affiliations]
+        elif not isinstance(affiliations, list):
+            if location:
+                logging.warning(
+                    f"{location}: Author entry {i} has invalid 'affiliations' type {type(affiliations).__name__}, defaulting to empty list"
+                )
             affiliations = []
 
         processed_authors.append({
@@ -54,6 +79,96 @@ def process_predicted_authors(predicted_authors: Any, line_num: int = -1) -> Lis
         })
 
     return processed_authors
+
+
+def _strip_known_suffixes(identifier: str) -> str:
+    lowered = identifier.lower()
+    for suffix in ('.tei.xml', '.pdf', '.jsonl', '.json', '.txt', '.xml'):
+        if lowered.endswith(suffix):
+            return identifier[: -len(suffix)]
+    return identifier
+
+
+def _extract_identifier(entry: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    priority_keys = [
+        'arxiv_id',
+        'arxivId',
+        'paper_id',
+        'doc_id',
+        'document_id',
+        'id',
+        'filename',
+        'file_name',
+    ]
+
+    for key in priority_keys:
+        if key not in entry:
+            continue
+
+        value = entry.get(key)
+        if value in (None, ""):
+            continue
+
+        raw_value = str(value).strip()
+        if not raw_value:
+            continue
+
+        if key in {'filename', 'file_name'}:
+            path = Path(raw_value)
+            name = path.name
+            name = _strip_known_suffixes(name)
+            raw_value = name
+
+        return raw_value, key
+
+    return None, None
+
+
+def _extract_prediction_list(entry: Dict[str, Any]) -> Any:
+    for key in ('predicted_authors', 'prediction', 'predictions', 'authors'):
+        if key in entry:
+            return entry[key]
+    return entry.get('predicted')
+
+
+def _record_prediction(
+    original_arxiv_id: Any,
+    raw_predicted_authors: Any,
+    predictions: Dict[str, List[Author]],
+    stats: Dict[str, int],
+    gt_arxiv_ids: Dict[str, str],
+    *,
+    line_num: int = -1,
+    context: Optional[str] = None,
+) -> None:
+    arxiv_id = ''
+    if original_arxiv_id is not None:
+        arxiv_id = str(original_arxiv_id).strip()
+
+    location = context or (f"Line {line_num}" if line_num != -1 else None)
+
+    if not arxiv_id:
+        if location:
+            logging.error(f"{location}: missing arxiv_id")
+        else:
+            logging.error("Missing arxiv_id")
+        stats['errors'] += 1
+        return
+
+    predicted_authors = process_predicted_authors(
+        raw_predicted_authors,
+        line_num=line_num,
+        context=context,
+    )
+
+    if predicted_authors:
+        stats['with_predictions'] += 1
+    else:
+        stats['null_predictions'] += 1
+
+    normalized_id = normalize_arxiv_id(arxiv_id)
+    target_id = gt_arxiv_ids.get(normalized_id, arxiv_id)
+    predictions[target_id] = predicted_authors
 
 
 def convert_content_to_predictions(input_file: str, output_file: str, ground_truth_file: str = None) -> None:
@@ -76,40 +191,98 @@ def convert_content_to_predictions(input_file: str, output_file: str, ground_tru
 
     logging.info(f"Reading from {input_file}...")
 
-    with open(input_file, 'r') as f:
-        for line_num, line in enumerate(f, 1):
-            if not line.strip():
-                continue
+    parsed_data: Any = None
+    parsed_successfully = False
+    try:
+        with open(input_file, 'r') as f:
+            parsed_data = json.load(f)
+            parsed_successfully = True
+    except json.JSONDecodeError:
+        parsed_data = None
+    except Exception as exc:
+        logging.debug(
+            f"Unable to parse {input_file} as a single JSON document: {exc}"
+        )
+        parsed_data = None
 
-            try:
-                entry = json.loads(line)
+    if parsed_successfully:
+        if isinstance(parsed_data, dict):
+            for idx, (raw_id, authors) in enumerate(parsed_data.items(), 1):
                 stats['total'] += 1
-
-                original_arxiv_id = entry.get('arxiv_id', '')
-                if not original_arxiv_id:
-                    logging.error(f"Line {line_num} missing arxiv_id")
+                context = f"Entry {raw_id!r}"
+                _record_prediction(
+                    raw_id,
+                    authors,
+                    predictions,
+                    stats,
+                    gt_arxiv_ids,
+                    context=context,
+                )
+        elif isinstance(parsed_data, list):
+            for idx, entry in enumerate(parsed_data, 1):
+                if not isinstance(entry, dict):
+                    logging.error(f"Entry {idx} is not a dict, skipping")
                     stats['errors'] += 1
                     continue
 
-                predicted_authors = process_predicted_authors(entry.get('predicted_authors'), line_num=line_num)
+                stats['total'] += 1
+                identifier, source_key = _extract_identifier(entry)
+                if not identifier:
+                    logging.error(f"Entry {idx} missing identifiable arxiv id fields")
+                    stats['errors'] += 1
+                    continue
 
-                if predicted_authors:
-                    stats['with_predictions'] += 1
-                else:
-                    stats['null_predictions'] += 1
+                predicted_block = _extract_prediction_list(entry)
+                context = f"Entry {idx}{f' ({source_key})' if source_key else ''}"
+                _record_prediction(
+                    identifier,
+                    predicted_block,
+                    predictions,
+                    stats,
+                    gt_arxiv_ids,
+                    context=context,
+                )
+        else:
+            logging.error(
+                f"Unsupported JSON structure in {input_file}: {type(parsed_data).__name__}"
+            )
+            stats['errors'] += 1
+    else:
+        with open(input_file, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
 
-                normalized_id = normalize_arxiv_id(original_arxiv_id)
-                if normalized_id in gt_arxiv_ids:
-                    predictions[gt_arxiv_ids[normalized_id]] = predicted_authors
-                else:
-                    predictions[original_arxiv_id] = predicted_authors
+                try:
+                    entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        logging.error(f"Line {line_num}: entry is not a dict, skipping")
+                        stats['errors'] += 1
+                        continue
 
-            except json.JSONDecodeError as e:
-                logging.error(f"Error parsing JSON on line {line_num}: {e}")
-                stats['errors'] += 1
-            except Exception as e:
-                logging.error(f"Error processing line {line_num}: {e}")
-                stats['errors'] += 1
+                    stats['total'] += 1
+                    identifier, source_key = _extract_identifier(entry)
+                    if not identifier:
+                        logging.error(f"Line {line_num}: missing identifiable arxiv id fields")
+                        stats['errors'] += 1
+                        continue
+
+                    predicted_block = _extract_prediction_list(entry)
+                    _record_prediction(
+                        identifier,
+                        predicted_block,
+                        predictions,
+                        stats,
+                        gt_arxiv_ids,
+                        line_num=line_num,
+                        context=f"Line {line_num}{f' ({source_key})' if source_key else ''}"
+                    )
+                except json.JSONDecodeError as e:
+                    logging.error(f"Error parsing JSON on line {line_num}: {e}")
+                    stats['errors'] += 1
+                except Exception as e:
+                    logging.error(f"Error processing line {line_num}: {e}")
+                    stats['errors'] += 1
 
     logging.info(f"Writing to {output_file}...")
     with open(output_file, 'w') as f:
