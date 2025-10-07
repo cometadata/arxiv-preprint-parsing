@@ -37,8 +37,3 @@ JSONL file with entries:
 - `workers`: Concurrent document workers (default: 4)
 - `max_concurrent_docs`: Max simultaneous documents (default: 8)
 - `system_prompt`: Custom system prompt or path to file
-
-
-## Requirements
-
-[Modal](https://modal.com/) account with GPU access (configured H100 by default).
