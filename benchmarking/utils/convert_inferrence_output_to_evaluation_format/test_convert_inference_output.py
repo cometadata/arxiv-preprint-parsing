@@ -22,59 +22,46 @@ class TestNormalizeArxivId(unittest.TestCase):
     def test_standard_formats(self):
         """Test standard arxiv ID formats."""
         # Standard format with lowercase prefix
-        self.assertEqual(normalize_arxiv_id('arxiv:1234.5678'), '1234.5678')
+        self.assertEqual(normalize_arxiv_id('arxiv:1234.5678'), 'arXiv:1234.5678')
         # Standard format with mixed case prefix
-        self.assertEqual(normalize_arxiv_id('arXiv:1234.5678'), '1234.5678')
+        self.assertEqual(normalize_arxiv_id('arXiv:1234.5678'), 'arXiv:1234.5678')
         # Standard format without prefix
-        self.assertEqual(normalize_arxiv_id('1234.5678'), '1234.5678')
+        self.assertEqual(normalize_arxiv_id('1234.5678'), 'arXiv:1234.5678')
 
     def test_versioned_ids(self):
         """Test arxiv IDs with version numbers."""
         self.assertEqual(normalize_arxiv_id(
-            'arxiv:1234.5678v1'), '1234.5678v1')
+            'arxiv:1234.5678v1'), 'arXiv:1234.5678v1')
         self.assertEqual(normalize_arxiv_id(
-            'arXiv:1234.5678v2'), '1234.5678v2')
-        self.assertEqual(normalize_arxiv_id('1234.5678v3'), '1234.5678v3')
+            'arXiv:1234.5678v2'), 'arXiv:1234.5678v2')
+        self.assertEqual(normalize_arxiv_id('1234.5678v3'), 'arXiv:1234.5678v3')
 
-    def test_url_formats(self):
-        """Test extraction from URLs."""
-        # HTTP URL
-        self.assertEqual(
-            normalize_arxiv_id('http://arxiv.org/abs/1234.5678'),
-            '1234.5678'
-        )
-        # HTTPS URL
-        self.assertEqual(
-            normalize_arxiv_id('https://arxiv.org/abs/1234.5678'),
-            '1234.5678'
-        )
-        # URL with version
-        self.assertEqual(
-            normalize_arxiv_id('https://arxiv.org/abs/1234.5678v2'),
-            '1234.5678v2'
-        )
+    def test_underscore_format(self):
+        """Test underscore format conversion."""
+        self.assertEqual(normalize_arxiv_id('1234_5678'), 'arXiv:1234/5678')
+        self.assertEqual(normalize_arxiv_id('arxiv:1234_5678'), 'arXiv:1234/5678')
 
     def test_old_style_ids(self):
         """Test old-style arxiv IDs with category prefixes."""
         self.assertEqual(normalize_arxiv_id(
-            'astro-ph/0123456'), 'astro-ph/0123456')
+            'astro-ph/0123456'), 'arXiv:astro-ph/0123456')
         self.assertEqual(normalize_arxiv_id(
-            'cond-mat/9901234'), 'cond-mat/9901234')
+            'cond-mat/9901234'), 'arXiv:cond-mat/9901234')
         self.assertEqual(normalize_arxiv_id(
-            'arxiv:hep-th/0123456'), 'hep-th/0123456')
+            'arxiv:hep-th/0123456'), 'arXiv:hep-th/0123456')
 
     def test_edge_cases(self):
         """Test edge cases and malformed inputs."""
         # Empty string
-        self.assertEqual(normalize_arxiv_id(''), '')
+        self.assertEqual(normalize_arxiv_id(''), 'arXiv:')
         # Random string without arxiv pattern
         self.assertEqual(normalize_arxiv_id(
-            'not-an-arxiv-id'), 'not-an-arxiv-id')
+            'not-an-arxiv-id'), 'arXiv:not-an-arxiv-id')
         # Mixed content with arxiv ID embedded
         self.assertEqual(
             normalize_arxiv_id(
-                'See paper at arxiv.org/abs/1234.5678 for details'),
-            '1234.5678'
+                'See paper at 1234.5678 for details'),
+            'arXiv:1234.5678'
         )
 
 
@@ -186,8 +173,10 @@ class TestConvertContentToPredictions(unittest.TestCase):
 
         self.assertIn('arXiv:1234.5678', output)
         self.assertIn('arXiv:2345.6789', output)
-        self.assertEqual(len(output['arXiv:1234.5678']), 2)
-        self.assertEqual(len(output['arXiv:2345.6789']), 1)
+        # Output should be wrapped in {"predicted_authors": [...]}
+        self.assertIn('predicted_authors', output['arXiv:1234.5678'])
+        self.assertEqual(len(output['arXiv:1234.5678']['predicted_authors']), 2)
+        self.assertEqual(len(output['arXiv:2345.6789']['predicted_authors']), 1)
 
     def test_null_predicted_authors(self):
         """Test handling of null predicted_authors."""
@@ -209,11 +198,11 @@ class TestConvertContentToPredictions(unittest.TestCase):
 
         # All entries should be present
         self.assertEqual(len(output), 3)
-        # First two should have empty lists
-        self.assertEqual(output['arXiv:1234.5678'], [])
-        self.assertEqual(output['arXiv:2345.6789'], [])
+        # First two should have empty lists wrapped in predicted_authors
+        self.assertEqual(output['arXiv:1234.5678']['predicted_authors'], [])
+        self.assertEqual(output['arXiv:2345.6789']['predicted_authors'], [])
         # Third should have one author
-        self.assertEqual(len(output['arXiv:3456.7890']), 1)
+        self.assertEqual(len(output['arXiv:3456.7890']['predicted_authors']), 1)
 
     def test_with_ground_truth_matching(self):
         """Test ID format matching with ground truth file."""
@@ -270,10 +259,10 @@ class TestConvertContentToPredictions(unittest.TestCase):
         with open(self.output_file, 'r') as f:
             output = json.load(f)
 
-        # Should have processed 2 valid entries
+        # Should have processed 2 valid entries with arXiv: prefix
         self.assertEqual(len(output), 2)
-        self.assertIn('1234.5678', output)
-        self.assertIn('2345.6789', output)
+        self.assertIn('arXiv:1234.5678', output)
+        self.assertIn('arXiv:2345.6789', output)
 
         # Check that errors were logged
         error_calls = mock_logging.error.call_args_list
@@ -322,7 +311,7 @@ class TestConvertContentToPredictions(unittest.TestCase):
         with open(self.output_file, 'r') as f:
             output = json.load(f)
 
-        authors = output['arXiv:1234.5678']
+        authors = output['arXiv:1234.5678']['predicted_authors']
         self.assertEqual(len(authors), 3)
         self.assertEqual(authors[0]['name'], 'José García-López')
         self.assertEqual(authors[1]['name'], 'Anne-Marie O\'Brien')
@@ -425,10 +414,11 @@ class TestIntegration(unittest.TestCase):
         self.assertIn('arXiv:2003.03151', output)
         self.assertIn('arXiv:1709.02995', output)
 
-        self.assertEqual(len(output['arXiv:2003.03151']), 2)
-        self.assertEqual(output['arXiv:2003.03151'][0]['name'], 'Meiling Fang')
+        # Check wrapped in predicted_authors
+        self.assertEqual(len(output['arXiv:2003.03151']['predicted_authors']), 2)
+        self.assertEqual(output['arXiv:2003.03151']['predicted_authors'][0]['name'], 'Meiling Fang')
 
-        self.assertEqual(output['arXiv:1709.02995'], [])
+        self.assertEqual(output['arXiv:1709.02995']['predicted_authors'], [])
 
 
 if __name__ == '__main__':

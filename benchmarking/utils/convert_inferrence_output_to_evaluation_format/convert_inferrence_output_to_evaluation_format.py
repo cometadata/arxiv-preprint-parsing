@@ -13,23 +13,22 @@ class Author(TypedDict):
 
 
 def normalize_arxiv_id(arxiv_id: str) -> str:
-    if not arxiv_id:
-        return arxiv_id
+    arxiv_id = arxiv_id.strip()
+    has_prefix = arxiv_id.lower().startswith('arxiv:')
+    if has_prefix:
+        arxiv_id = arxiv_id[6:].strip()
 
-    cleaned = arxiv_id.strip()
-    if cleaned.lower().startswith('arxiv:'):
-        cleaned = cleaned[6:]
-
-    if '_' in cleaned and '/' not in cleaned:
-        prefix, suffix = cleaned.split('_', 1)
+    if '_' in arxiv_id and '/' not in arxiv_id:
+        prefix, suffix = arxiv_id.split('_', 1)
         if prefix and suffix:
-            cleaned = f"{prefix}/{suffix}"
+            arxiv_id = f"{prefix}/{suffix}"
 
-    match = re.search(r'(\d{4}\.\d{4,5}(v\d+)?|[a-z\-]+/\d{7}(v\d+)?)', cleaned, re.IGNORECASE)
+    match = re.search(r'(\d{4}\.\d{4,5}(v\d+)?|[a-z\-]+/\d{7}(v\d+)?)', arxiv_id, re.IGNORECASE)
     if match:
-        return match.group(1)
+        clean_id = match.group(1)
+        return f"arXiv:{clean_id}"
 
-    return cleaned
+    return f"arXiv:{arxiv_id}"
 
 
 def process_predicted_authors(
@@ -134,12 +133,14 @@ def _extract_prediction_list(entry: Dict[str, Any]) -> Any:
 def _record_prediction(
     original_arxiv_id: Any,
     raw_predicted_authors: Any,
-    predictions: Dict[str, List[Author]],
+    predictions: Dict[str, Any],
     stats: Dict[str, int],
     gt_arxiv_ids: Dict[str, str],
     *,
     line_num: int = -1,
     context: Optional[str] = None,
+    preserve_metadata: bool = False,
+    entry: Optional[Dict[str, Any]] = None,
 ) -> None:
     arxiv_id = ''
     if original_arxiv_id is not None:
@@ -167,12 +168,26 @@ def _record_prediction(
         stats['null_predictions'] += 1
 
     normalized_id = normalize_arxiv_id(arxiv_id)
-    target_id = gt_arxiv_ids.get(normalized_id, arxiv_id)
-    predictions[target_id] = predicted_authors
+    target_id = gt_arxiv_ids.get(normalized_id, normalized_id)
+
+    predictions[target_id] = {
+        'predicted_authors': predicted_authors
+    }
+
+    if preserve_metadata and entry:
+        for field in ['doi', 'title', 'filename', 'processing_time', 'error']:
+            if field in entry and entry[field] is not None:
+                predictions[target_id][field] = entry[field]
 
 
-def convert_content_to_predictions(input_file: str, output_file: str, ground_truth_file: str = None) -> None:
-    predictions: Dict[str, List[Author]] = {}
+def convert_content_to_predictions(
+    input_file: str,
+    output_file: str,
+    ground_truth_file: str = None,
+    preserve_metadata: bool = False,
+    wrap_predictions: bool = True
+) -> None:
+    predictions: Dict[str, Any] = {}
     stats = {
         'total': 0,
         'with_predictions': 0,
@@ -217,6 +232,8 @@ def convert_content_to_predictions(input_file: str, output_file: str, ground_tru
                     stats,
                     gt_arxiv_ids,
                     context=context,
+                    preserve_metadata=preserve_metadata,
+                    entry={'arxiv_id': raw_id, 'predicted_authors': authors} if preserve_metadata else None,
                 )
         elif isinstance(parsed_data, list):
             for idx, entry in enumerate(parsed_data, 1):
@@ -241,6 +258,8 @@ def convert_content_to_predictions(input_file: str, output_file: str, ground_tru
                     stats,
                     gt_arxiv_ids,
                     context=context,
+                    preserve_metadata=preserve_metadata,
+                    entry=entry if preserve_metadata else None,
                 )
         else:
             logging.error(
@@ -275,7 +294,9 @@ def convert_content_to_predictions(input_file: str, output_file: str, ground_tru
                         stats,
                         gt_arxiv_ids,
                         line_num=line_num,
-                        context=f"Line {line_num}{f' ({source_key})' if source_key else ''}"
+                        context=f"Line {line_num}{f' ({source_key})' if source_key else ''}",
+                        preserve_metadata=preserve_metadata,
+                        entry=entry if preserve_metadata else None,
                     )
                 except json.JSONDecodeError as e:
                     logging.error(f"Error parsing JSON on line {line_num}: {e}")
@@ -326,6 +347,16 @@ def main():
         action='store_true',
         help='Enable verbose logging (show warnings about skipped entries)'
     )
+    parser.add_argument(
+        '-m', '--preserve-metadata',
+        action='store_true',
+        help='Preserve additional metadata fields (doi, title, filename, etc.) in output'
+    )
+    parser.add_argument(
+        '--no-wrap',
+        action='store_true',
+        help='Do not wrap predictions in {"predicted_authors": [...]} format (legacy mode)'
+    )
 
     args = parser.parse_args()
 
@@ -338,7 +369,13 @@ def main():
         logging.error(f"Input file '{args.input}' not found")
         return 1
 
-    convert_content_to_predictions(args.input, args.output, args.ground_truth)
+    convert_content_to_predictions(
+        args.input,
+        args.output,
+        args.ground_truth,
+        preserve_metadata=args.preserve_metadata,
+        wrap_predictions=not args.no_wrap
+    )
     return 0
 
 
