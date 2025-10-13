@@ -6,10 +6,86 @@ import gzip
 import argparse
 import subprocess
 from tqdm import tqdm
+from typing import Tuple, Dict, List
 
 MANIFEST_FILE = 'arxiv_pdf_manifest.json'
 MANIFEST_URL = 'gs://arxiv-dataset/arxiv-dataset_list-of-files.txt.gz'
 MANIFEST_GZ = 'arxiv-dataset_list-of-files.txt.gz'
+
+
+def detect_arxiv_format(arxiv_id: str) -> Tuple[str, str]:
+    if re.match(r'^\d{4}\.\d{4,5}$', arxiv_id):
+        return 'modern', arxiv_id
+
+    if '/' in arxiv_id:
+        return 'legacy', arxiv_id
+
+    if re.match(r'^\d', arxiv_id):
+        return 'modern', arxiv_id
+
+    return 'unknown', arxiv_id
+
+
+def construct_pdf_url(arxiv_id: str, version: int = 1) -> str:
+    format_type, normalized_id = detect_arxiv_format(arxiv_id)
+
+    if format_type == 'modern':
+        yymm = normalized_id[:4]
+        return f"gs://arxiv-dataset/arxiv/arxiv/pdf/{yymm}/{normalized_id}v{version}.pdf"
+
+    if format_type == 'legacy':
+        category, number = normalized_id.split('/', 1)
+        yymm = number[:4]
+        return f"gs://arxiv-dataset/arxiv/{category}/pdf/{yymm}/{number}v{version}.pdf"
+
+    return ""
+
+
+def batch_verify_urls(urls_to_verify: List[str]) -> Dict[str, List[str]]:
+    if not urls_to_verify:
+        return {}
+
+    results: Dict[str, List[str]] = {}
+    wildcard_patterns = [
+        re.sub(r'v\d+\.pdf$', 'v*.pdf', url) for url in urls_to_verify
+    ]
+
+    print(f"Verifying {len(wildcard_patterns)} URLs with gsutil...")
+    chunk_size = 64
+
+    for start in range(0, len(wildcard_patterns), chunk_size):
+        chunk = wildcard_patterns[start:start + chunk_size]
+        command = ['gsutil', '-m', 'ls'] + chunk
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True
+            )
+        except FileNotFoundError:
+            print("\nError: 'gsutil' command not found.", file=sys.stderr)
+            print("Please ensure the Google Cloud SDK is installed and 'gsutil' is in your system's PATH.", file=sys.stderr)
+            sys.exit(1)
+
+        stdout_lines = completed.stdout.splitlines()
+        stderr_lines = completed.stderr.splitlines()
+
+        for line in stdout_lines:
+            line = line.strip()
+            if line.startswith('gs://') and line.endswith('.pdf'):
+                base_url = re.sub(r'v\d+\.pdf$', '', line)
+                results.setdefault(base_url, []).append(line)
+
+        for line in stderr_lines:
+            if 'No URLs matched' in line:
+                match = re.search(r'No URLs matched: (.+)', line)
+                if match:
+                    failed_pattern = match.group(1).strip()
+                    base_url = re.sub(r'v\*\.pdf$', '', failed_pattern)
+                    results.setdefault(base_url, [])
+
+        if completed.returncode not in (0, 1):
+            print(f"gsutil ls returned {completed.returncode} for chunk starting at index {start}.", file=sys.stderr)
+
+    return results
 
 
 def build_or_load_manifest(force_rebuild: bool) -> dict:
@@ -65,6 +141,66 @@ def build_or_load_manifest(force_rebuild: bool) -> dict:
     return manifest
 
 
+def url_generator(arxiv_ids: List[str], manifest: dict) -> List[str]:
+    urls: List[str] = []
+    urls_to_verify: List[str] = []
+    id_to_tentative_url: Dict[str, str] = {}
+
+    print(f"Generating URLs for {len(arxiv_ids)} papers...")
+
+    for arxiv_id in tqdm(arxiv_ids, desc="Processing IDs"):
+        if arxiv_id in manifest:
+            available_versions = manifest[arxiv_id]
+            if available_versions:
+                latest_version_url = sorted(
+                    available_versions,
+                    key=lambda url: int(re.search(r'v(\d+)\.pdf$', url).group(1))
+                )[-1]
+                urls.append(latest_version_url)
+                continue
+
+        constructed_url = construct_pdf_url(arxiv_id, version=1)
+        if constructed_url:
+            urls_to_verify.append(constructed_url)
+            id_to_tentative_url[arxiv_id] = constructed_url
+        else:
+            print(f"Warning: Could not construct URL for '{arxiv_id}'.", file=sys.stderr)
+
+    if urls_to_verify:
+        print(f"\n{len(urls_to_verify)} papers not in manifest. Verifying availability...")
+        verification_results = batch_verify_urls(urls_to_verify)
+
+        found_count = 0
+        not_found_ids: List[str] = []
+
+        for arxiv_id, tentative_url in id_to_tentative_url.items():
+            base_url = re.sub(r'v\d+\.pdf$', '', tentative_url)
+            available_versions = verification_results.get(base_url, [])
+
+            if available_versions:
+                latest_version = sorted(
+                    available_versions,
+                    key=lambda url: int(re.search(r'v(\d+)\.pdf$', url).group(1))
+                )[-1]
+                urls.append(latest_version)
+                found_count += 1
+            else:
+                not_found_ids.append(arxiv_id)
+
+        print(f"Verification complete: {found_count} found, {len(not_found_ids)} not found.")
+
+        if not_found_ids:
+            print("\nPapers not found in dataset:")
+            for missing_id in not_found_ids[:10]:
+                print(f"  - {missing_id}")
+            if len(not_found_ids) > 10:
+                remainder = len(not_found_ids) - 10
+                print(f"  ... and {remainder} more")
+
+    print(f"\nTotal URLs ready for download: {len(urls)}")
+    return urls
+
+
 def generate_gcs_urls(json_path: str, manifest: dict) -> list[str]:
     try:
         with open(json_path, 'r') as f:
@@ -79,28 +215,17 @@ def generate_gcs_urls(json_path: str, manifest: dict) -> list[str]:
         print(f"Error: Could not decode JSON from file '{json_path}'. Check for syntax errors.", file=sys.stderr)
         sys.exit(1)
 
-    urls = []
-    found_count = 0
-    for item in tqdm(data, desc="Generating URLs from manifest"):
+    arxiv_ids: List[str] = []
+    for item in tqdm(data, desc="Collecting arXiv IDs"):
         arxiv_id = item.get('arxiv_id')
-        if not arxiv_id:
-            continue
+        if arxiv_id:
+            arxiv_ids.append(arxiv_id)
 
-        if arxiv_id in manifest:
-            available_versions = manifest[arxiv_id]
-            if not available_versions:
-                continue
-            latest_version_url = sorted(
-                available_versions,
-                key=lambda url: int(re.search(r'v(\d+)\.pdf$', url).group(1))
-            )[-1]
-            urls.append(latest_version_url)
-            found_count += 1
-        else:
-            print(f"Warning: arXiv ID '{arxiv_id}' not found in manifest. Skipping.", file=sys.stderr)
+    if not arxiv_ids:
+        print("No arxiv_id fields found in input JSON.", file=sys.stderr)
+        return []
 
-    print(f"\nFound {found_count} matching PDFs in manifest out of {len(data)} total entries.")
-    return urls
+    return url_generator(arxiv_ids, manifest)
 
 
 def download_pdfs_with_gsutil(urls: list[str], output_dir: str):
