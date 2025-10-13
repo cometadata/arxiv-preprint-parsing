@@ -115,6 +115,7 @@ def download_pdfs_with_gsutil(urls: list[str], output_dir: str):
         'gsutil',
         '-m',
         'cp',
+        '-n',
         '-I',
         output_dir
     ]
@@ -135,6 +136,23 @@ def download_pdfs_with_gsutil(urls: list[str], output_dir: str):
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def filter_already_downloaded(urls: list[str], output_dir: str) -> list[str]:
+    # Look at filenames that would be created by gsutil (the URL basename)
+    existing = set(os.listdir(output_dir)) if os.path.isdir(output_dir) else set()
+    missing = []
+    skipped = 0
+    for url in urls:
+        fname = os.path.basename(url)
+        if fname in existing:
+            skipped += 1
+            continue
+        missing.append(url)
+    if skipped:
+        print(f"Skipping {skipped} PDFs already present in '{output_dir}'.")
+    return missing
+
 
 
 def main():
@@ -160,6 +178,10 @@ def main():
 
     manifest = build_or_load_manifest(args.force_rebuild_manifest)
     urls_to_download = generate_gcs_urls(args.input_json, manifest)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    urls_to_download = filter_already_downloaded(urls_to_download, args.output_dir)
+
     download_pdfs_with_gsutil(urls_to_download, args.output_dir)
 
 
