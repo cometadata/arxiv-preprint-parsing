@@ -1,6 +1,6 @@
-# DoTS.ocr Batch Inference (vLLM + Modal)
+# dots.ocr Batch Inference
 
-Batch OCR and layout analysis for PDFs using [DoTS.ocr](https://huggingface.co/rednote-hilab/dots.ocr) model via [vLLM](https://github.com/vllm-project/vllm) on Modal.
+Batch OCR and layout analysis for PDFs using [dots.ocr](https://github.com/rednote-hilab/dots.ocr) model via [vLLM](https://github.com/vllm-project/vllm) on Modal.
 
 
 ## Installation
