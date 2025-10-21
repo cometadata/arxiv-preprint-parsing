@@ -1,95 +1,100 @@
 # dots.ocr Batch Inference
 
-Batch OCR and layout analysis for PDFs using the [dots.ocr](https://github.com/rednote-hilab/dots.ocr) model via [vLLM](https://github.com/vllm-project/vllm) on Modal](https://modal.com/).
+Batch OCR and layout analysis for PDFs using the [dots.ocr](https://github.com/rednote-hilab/dots.ocr) model and [vLLM](https://github.com/vllm-project/vllm) on [Modal](https://modal.com/).
 
 
-## Installation
+## Prerequisites
 
-Set up a [Modal](https://modal.com/) account, then:
+1. Modal account with volumes created for data, model weights, and the vLLM cache.
+2. Set the environment variables before invoking `modal run`, e.g.:
+   ```bash
+   export DOTS_MODAL_APP_NAME="dots-ocr-vllm-batch"
+   export DOTS_MODAL_DATA_VOLUME="dots-ocr-data"
+   export DOTS_MODAL_MODEL_VOLUME="dots-ocr-models"
+   export DOTS_MODAL_VLLM_CACHE_VOLUME="dots-ocr-vllm-cache"
+   ```
+3. Install runtime dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-pip install modal
-```
 
-## Usage
-
-```bash
-modal run dots-ocr_batch_inference_vllm_modal.py --manifest manifest.jsonl
-```
-
-### Basic Usage
+## Running The Batch Pipeline
 
 ```bash
 modal run dots-ocr_batch_inference_vllm_modal.py \
   --manifest /data/manifest.jsonl \
+  --output-path /data/dots_predictions.jsonl \
+  --error-path /data/dots_errors.jsonl \
+  --model-name rednote-hilab/dots.ocr \
+  --download-dir /tmp/pdf_files \
+  --log-path /data/dots_batch.log \
+  --model-cache-dir /models \
+  --vllm-port 30024 \
   --prompt-mode layout-all \
   --workers 4
 ```
 
-### Process Specific PDFs
+All paths must exist inside the Modal container (i.e. via mounted volumes).
+
+### Processing A Subset Of PDFs
 
 ```bash
 modal run dots-ocr_batch_inference_vllm_modal.py \
-  --manifest manifest.jsonl \
-  --pdf-filenames "doc1.pdf,doc2.pdf,doc3.pdf"
+  --manifest /data/manifest.jsonl \
+  --output-path /data/dots_predictions.jsonl \
+  --error-path /data/dots_errors.jsonl \
+  --model-name rednote-hilab/dots.ocr \
+  --download-dir /tmp/pdf_files \
+  --log-path /data/dots_batch.log \
+  --model-cache-dir /models \
+  --vllm-port 30024 \
+  --pdf-filenames "doc1.pdf,doc2.pdf"
 ```
+
+### Optional Concurrency and Retry Arguments
+
+- `--max-concurrent-docs`: hard cap on concurrent documents (default logic: min(workers, 8))
+- `--max-inflight-requests`: cap on simultaneous API calls (default: 128)
+- `--max-page-concurrency`: limit pages per document processed in parallel (default: 2)
+- `--max-pages-per-doc`: truncate documents to the first *n* pages
+- `--request-timeout`: timeout in seconds for completion requests (default: 180)
+- `--max-retries`: retries per page on failure (default: 3)
+- `--batch-id`: annotate metrics with a custom identifier
+- `--tensor-parallel-size`, `--gpu-memory-utilization`, `--max-model-len`: pass-through tuning knobs for vLLM
 
 
 ## Manifest Format
 
-JSONL file with entries:
+The input manifest is JSONL, one record per document:
+
 ```json
 {"document_id": "doc1", "pdf_path": "s3://bucket/doc.pdf", "pages": [1, 2, 3]}
 {"document_id": "doc2", "pdf_path": "/local/path.pdf"}
 ```
 
-Fields:
-- `document_id` or `id`: Unique document identifier
-- `pdf_path`: Path to PDF (S3 URI or local path)
-- `pages`: Optional list of page numbers to process (processes all pages if omitted)
+- `document_id` or `id`: unique identifier for the document
+- `pdf_path`: S3 URI, HTTP URL, or local/volume path
+- `pages`: optional page numbers to process; the entire document is used if omitted
 
 
 ## Prompt Modes
 
-The script supports three modes via the `--prompt-mode` argument:
+Choose with `--prompt-mode`:
 
-- `layout-all` (default): Outputs layout information with bounding boxes, categories, and text content.
-
-- `layout-only`: Outputs only layout bounding boxes and categories without text content.
-
-- `ocr`: Simple OCR mode that converts document images to markdown format.
+- `layout-all`: layout categories, bounding boxes, and associated text
+- `layout-only`: layout categories and bounding boxes without text
+- `ocr`: Markdown OCR output without layout annotations
 
 
-## Arguments
+## Outputs
 
-### Main Arguments
+Two JSONL files are generated: one for successful pages, the other for failures.
 
-- `--manifest`: Input manifest file (default: `/data/manifest.jsonl`)
-- `--prompt-mode`: Processing mode - `layout-all`, `layout-only`, or `ocr` (default: `layout-all`)
-- `--workers`: Concurrent document workers (default: 4)
-- `--max-concurrent-docs`: Max simultaneous documents (default: min(workers, 8))
-- `--max-inflight-requests`: Max concurrent API requests (default: 128)
-- `--pdf-filenames`: Comma or space-separated list of specific PDF filenames to process
+### Success File (`--output-path`)
 
-### Additional Arguments
+Each record contains page-level metadata and the generated content:
 
-- `output_path`: Successful predictions (default: `/data/dots_predictions.jsonl`)
-- `error_path`: Failed pages (default: `/data/dots_errors.jsonl`)
-- `model_name`: HuggingFace model ID (default: `rednote-hilab/dots.ocr`)
-- `tensor_parallel_size`: GPUs for tensor parallelism (default: 1)
-- `gpu_memory_utilization`: GPU memory utilization fraction
-- `max_model_len`: Maximum model context length (default: 131072)
-- `max_pages_per_doc`: Limit pages per document
-- `request_timeout`: API request timeout in seconds (default: 180.0)
-- `max_retries`: Maximum retry attempts per page (default: 3)
-- `batch_id`: Optional batch identifier for tracking
-
-
-## Output Format
-
-### Success File (`dots_predictions.jsonl`)
-
-Each line contains:
 ```json
 {
   "document_id": "doc1",
@@ -105,9 +110,10 @@ Each line contains:
 }
 ```
 
-### Error File (`dots_errors.jsonl`)
+### Error File (`--error-path`)
 
-Failed pages with error information:
+Failures record the exception string:
+
 ```json
 {
   "document_id": "doc1",

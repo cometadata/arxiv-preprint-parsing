@@ -16,7 +16,11 @@ from typing import Any, Dict, List, Optional, Set
 from io import BytesIO
 from urllib.parse import urlparse
 
-import modal
+modal = None  # type: ignore
+try:
+    import modal
+except ImportError:
+    raise RuntimeError("modal must be installed to use this script")
 
 try:
     import boto3
@@ -44,7 +48,20 @@ except ImportError:
     PdfReader = None  # type: ignore
 
 
-app = modal.App("rolmocr-vllm-batch")
+def require_env_var(var_name: str) -> str:
+    value = os.environ.get(var_name)
+    if not value:
+        raise RuntimeError(f"Environment variable {var_name} must be set")
+    return value
+
+
+MODAL_APP_NAME = require_env_var("DOTS_MODAL_APP_NAME")
+DATA_VOLUME_NAME = require_env_var("DOTS_MODAL_DATA_VOLUME")
+MODEL_VOLUME_NAME = require_env_var("DOTS_MODAL_MODEL_VOLUME")
+VLLM_CACHE_VOLUME_NAME = require_env_var("DOTS_MODAL_VLLM_CACHE_VOLUME")
+
+
+app = modal.App(MODAL_APP_NAME)
 
 
 def _build_image() -> modal.Image:
@@ -86,14 +103,12 @@ def _build_image() -> modal.Image:
     )
 
 
-DATA_VOLUME = modal.Volume.from_name("rolmocr-data", create_if_missing=True)
-MODEL_VOLUME = modal.Volume.from_name("dots-ocr-models", create_if_missing=True)
-VLLM_CACHE_VOLUME = modal.Volume.from_name("dots-ocr-vllm-cache", create_if_missing=True)
+DATA_VOLUME = modal.Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
+MODEL_VOLUME = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
+VLLM_CACHE_VOLUME = modal.Volume.from_name(VLLM_CACHE_VOLUME_NAME, create_if_missing=True)
 
 IMAGE = _build_image()
 
-DEFAULT_MODEL = os.environ.get("DOTS_MODEL", "rednote-hilab/dots.ocr")
-VLLM_PORT = int(os.environ.get("VLLM_PORT", "30024"))
 MODEL_MAX_CONTEXT = 131072
 MAX_COMPLETION_TOKENS = 65536
 
@@ -129,19 +144,25 @@ PROMPT_TEMPLATES = {
 
 @dataclass
 class BatchConfig:
-    input_manifest: Path = Path("/data/manifest.jsonl")
-    output_path: Path = Path("/data/dots_predictions.jsonl")
-    errored_path: Path = Path("/data/dots_errors.jsonl")
-    download_dir: Path = Path("/tmp/pdfs")
+    input_manifest: Path
+    output_path: Path
+    errored_path: Path
+    download_dir: Path
     max_pages_per_doc: Optional[int] = None
     workers: int = 4
     max_concurrent_docs: int = 8
     max_inflight_requests: int = 128
+    min_inflight_requests: Optional[int] = None
+    initial_inflight_requests: Optional[int] = None
+    max_page_concurrency: int = 2
+    initial_doc_concurrency: Optional[int] = None
     request_timeout: float = 180.0
     max_retries: int = 3
     initial_temperature: float = 0.0
     temperature_increment: float = 0.1
-    target_longest_dim: int = 1024
+    target_longest_dim: Optional[int] = None
+    min_render_dpi: int = 200
+    max_render_pixels: int = 11_289_600
     batch_id: Optional[str] = None
     prompt_mode: str = "layout-all"
     target_pdf_filenames: Optional[Set[str]] = None
@@ -188,8 +209,70 @@ class Metrics:
         }
 
 
-def setup_logging(log_path: Path = Path("/data/dots_batch.log")) -> logging.Logger:
-    logger = logging.getLogger("dots-batch")
+class AdaptiveSemaphore:
+    def __init__(
+        self,
+        initial: int,
+        *,
+        min_limit: int = 1,
+        max_limit: Optional[int] = None,
+    ) -> None:
+        if initial < 1:
+            raise ValueError("Semaphore initial permits must be >= 1")
+        self._min_limit = max(1, min_limit)
+        self._max_limit = max_limit if max_limit is None else max(self._min_limit, max_limit)
+        clamped_initial = max(self._min_limit, initial)
+        if self._max_limit is not None:
+            clamped_initial = min(clamped_initial, self._max_limit)
+        self._sem = asyncio.Semaphore(clamped_initial)
+        self._limit = clamped_initial
+        self._pending_shrink = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def min_limit(self) -> int:
+        return self._min_limit
+
+    @property
+    def max_limit(self) -> Optional[int]:
+        return self._max_limit
+
+    @property
+    def current_limit(self) -> int:
+        return self._limit
+
+    async def acquire(self) -> None:
+        await self._sem.acquire()
+
+    def release(self) -> None:
+        if self._pending_shrink > 0:
+            self._pending_shrink -= 1
+        else:
+            self._sem.release()
+
+    async def adjust_limit(self, new_limit: int) -> None:
+        async with self._lock:
+            target = max(self._min_limit, new_limit)
+            if self._max_limit is not None:
+                target = min(target, self._max_limit)
+            delta = target - self._limit
+            if delta > 0:
+                for _ in range(delta):
+                    self._sem.release()
+            elif delta < 0:
+                self._pending_shrink += -delta
+            self._limit = target
+
+    async def __aenter__(self) -> "AdaptiveSemaphore":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+def setup_logging(log_path: Path) -> logging.Logger:
+    logger = logging.getLogger("dots-train-batch")
     if logger.handlers:
         return logger
 
@@ -265,7 +348,13 @@ def is_jpeg(file_path: str) -> bool:
         return False
 
 
-def render_pdf_to_base64png(pdf_path: str, page_num: int, target_longest_dim: int = 1024) -> str:
+def render_pdf_to_base64png(
+    pdf_path: str,
+    page_num: int,
+    target_longest_dim: Optional[int] = None,
+    min_render_dpi: int = 200,
+    max_render_pixels: int = 11_289_600,
+) -> str:
     if fitz is None:
         raise RuntimeError("PyMuPDF (fitz) is required but not installed")
     if Image is None:
@@ -278,7 +367,16 @@ def render_pdf_to_base64png(pdf_path: str, page_num: int, target_longest_dim: in
 
         page_rect = page.rect
         current_longest = max(page_rect.width, page_rect.height)
-        zoom = target_longest_dim / current_longest
+
+        if target_longest_dim and target_longest_dim > 0:
+            zoom = target_longest_dim / current_longest
+        else:
+            zoom = max(min_render_dpi, 1) / 72.0
+
+        total_pixels = (page_rect.width * page_rect.height) * (zoom**2)
+        if total_pixels > max_render_pixels:
+            clamp = (max_render_pixels / total_pixels) ** 0.5
+            zoom *= clamp
 
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -320,8 +418,10 @@ def launch_vllm_server(
     tensor_parallel_size: int,
     gpu_memory_utilization: Optional[float],
     max_model_len: int,
-    semaphore: asyncio.Semaphore,
-    max_doc_concurrency: int,
+    port: int,
+    doc_limiter: AdaptiveSemaphore,
+    request_limiter: AdaptiveSemaphore,
+    page_concurrency: int,
     logger: logging.Logger,
 ) -> tuple[subprocess.Popen[str], asyncio.Task[Any]]:
     cache_dir = Path("/root/.cache/vllm")
@@ -332,7 +432,7 @@ def launch_vllm_server(
         "serve",
         str(model_path),
         "--port",
-        str(VLLM_PORT),
+        str(port),
         "--served-model-name",
         "dots-ocr",
         "--tensor-parallel-size",
@@ -351,14 +451,23 @@ def launch_vllm_server(
     env = {**os.environ, "VLLM_USE_V1": "1", "VLLM_CACHE_DIR": str(cache_dir)}
     logger.info("Starting vLLM server: %s", " ".join(cmd))
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-    monitor_task = asyncio.create_task(monitor_vllm_logs(process, semaphore, max_doc_concurrency, logger))
+    monitor_task = asyncio.create_task(
+        monitor_vllm_logs(
+            process=process,
+            doc_limiter=doc_limiter,
+            request_limiter=request_limiter,
+            page_concurrency=page_concurrency,
+            logger=logger,
+        )
+    )
     return process, monitor_task
 
 
 async def monitor_vllm_logs(
     process: subprocess.Popen[str],
-    semaphore: asyncio.Semaphore,
-    max_doc_concurrency: int,
+    doc_limiter: AdaptiveSemaphore,
+    request_limiter: AdaptiveSemaphore,
+    page_concurrency: int,
     logger: logging.Logger,
 ) -> None:
     assert process.stdout and process.stderr
@@ -366,63 +475,144 @@ async def monitor_vllm_logs(
     last_running_req = 0
     peak_running_req = 0
     last_queue_req = 0
-    running_reqs_decreased = False
+    prompt_tps: Optional[float] = None
+    gen_tps: Optional[float] = None
+    kv_usage: Optional[float] = None
     server_ready = False
-    last_semaphore_release = time.time()
-    current_slots = 1
+    adjust_down_cooldown = 10.0
+    adjust_up_cooldown = 20.0
+    last_adjust_down = 0.0
+    last_adjust_up = 0.0
+    page_concurrency = max(1, page_concurrency)
+
+    throughput_re = re.compile(
+        r"Avg prompt throughput:\s*([\d.]+)\s*tokens/s,\s*Avg generation throughput:\s*([\d.]+)\s*tokens/s"
+    )
+    running_re = re.compile(r"Running:\s*(\d+)")
+    queue_re = re.compile(r"(?:Waiting|Pending):\s*(\d+)")
+    kv_usage_re = re.compile(r"GPU KV cache usage:\s*([\d.]+)%")
+
+    async def maybe_adjust() -> None:
+        nonlocal last_adjust_down, last_adjust_up
+        if not server_ready or prompt_tps is None or gen_tps is None:
+            return
+
+        now = time.time()
+        ratio = prompt_tps / max(gen_tps, 1e-3)
+
+        current_req_limit = request_limiter.current_limit
+        min_req = request_limiter.min_limit
+        max_req = request_limiter.max_limit if request_limiter.max_limit is not None else float("inf")
+
+        current_doc_limit = doc_limiter.current_limit
+        min_doc = doc_limiter.min_limit
+        max_doc = doc_limiter.max_limit if doc_limiter.max_limit is not None else float("inf")
+
+        generation_lagging = gen_tps < prompt_tps * 0.25
+        heavily_unbalanced = ratio > 12.0
+        high_kv = kv_usage is not None and kv_usage > 90.0
+        backlog = last_queue_req > 0
+        kv_ok = kv_usage is None or kv_usage < 80.0
+        ratio_ok = ratio < 4.0 or gen_tps >= prompt_tps * 0.5
+        doc_capacity = max(1, current_doc_limit * page_concurrency)
+        saturated_docs = last_running_req >= max(1, int(doc_capacity * 0.7))
+        saturated_requests = last_running_req >= max(1, int(current_req_limit * 0.7))
+
+        # Prefer reducing concurrency if decode throughput is lagging or KV cache is saturated.
+        if (
+            (generation_lagging or heavily_unbalanced or high_kv)
+            and current_req_limit > min_req
+            and last_running_req >= max(1, current_req_limit // 2)
+            and now - last_adjust_down >= adjust_down_cooldown
+        ):
+            decrease = max(1, current_req_limit // 6)
+            target_req = max(min_req, current_req_limit - decrease)
+            if target_req < current_req_limit:
+                await request_limiter.adjust_limit(target_req)
+                current_req_limit = request_limiter.current_limit
+                logger.info(
+                    "Reducing request concurrency to %s (prompt_tps=%.1f, gen_tps=%.1f, ratio=%.2f, running=%s)",
+                    current_req_limit,
+                    prompt_tps,
+                    gen_tps,
+                    ratio,
+                    last_running_req,
+                )
+                last_adjust_down = now
+
+            if doc_limiter.current_limit > min_doc:
+                await doc_limiter.adjust_limit(doc_limiter.current_limit - 1)
+                logger.info("Reducing document concurrency to %s", doc_limiter.current_limit)
+                last_adjust_down = now
+            return
+
+        # Grow cautiously when decode is keeping up and vLLM appears under-utilized.
+        if (
+            (backlog or saturated_docs or saturated_requests)
+            and kv_ok
+            and ratio_ok
+            and now - last_adjust_up >= adjust_up_cooldown
+        ):
+            adjusted = False
+
+            if (backlog or saturated_docs) and doc_limiter.current_limit < max_doc:
+                await doc_limiter.adjust_limit(doc_limiter.current_limit + 1)
+                logger.info("Increasing document concurrency to %s", doc_limiter.current_limit)
+                adjusted = True
+
+            current_req_limit = request_limiter.current_limit
+            if (backlog or saturated_requests or saturated_docs) and current_req_limit < max_req:
+                increase = max(1, max(4, current_req_limit // 5))
+                target_req = current_req_limit + increase
+                target_req = min(target_req, max_req)
+                if target_req > current_req_limit:
+                    await request_limiter.adjust_limit(target_req)
+                    logger.info(
+                        "Increasing request concurrency to %s (queue=%s, ratio=%.2f)",
+                        request_limiter.current_limit,
+                        last_queue_req,
+                        ratio,
+                    )
+                    adjusted = True
+
+            if adjusted:
+                last_adjust_up = now
 
     async def process_line(line: str) -> None:
-        nonlocal last_running_req, peak_running_req, last_queue_req, running_reqs_decreased, server_ready, last_semaphore_release, current_slots
+        nonlocal last_running_req, peak_running_req, last_queue_req, server_ready, prompt_tps, gen_tps, kv_usage
         if not line:
             return
         logger.info(line)
 
-        if not server_ready and ("The server is fired up and ready to roll!" in line or "Starting vLLM API server" in line):
+        if not server_ready and (
+            "The server is fired up and ready to roll!" in line or "Starting vLLM API server" in line
+        ):
             server_ready = True
-            last_semaphore_release = time.time()
 
         if "Detected errors during sampling" in line:
             logger.error("vLLM reported sampling errors; exiting")
             raise RuntimeError("vLLM sampling error")
 
-        if match := re.search(r"Running: (\d+)", line):
+        if match := running_re.search(line):
             current_running = int(match.group(1))
             if current_running > peak_running_req:
                 peak_running_req = current_running
-                logger.info(f"New peak running requests: {peak_running_req}")
-            if current_running < last_running_req and not running_reqs_decreased:
-                running_reqs_decreased = True
-                logger.info(f"Running requests decreased: {last_running_req} -> {current_running}")
+                logger.info("New peak running requests: %s", peak_running_req)
             last_running_req = current_running
 
-        if match := re.search(r"(?:Waiting|Pending):\s*(\d+)", line):
+        if match := queue_re.search(line):
             last_queue_req = int(match.group(1))
-            logger.info(f"vLLM running req: {last_running_req} queue req: {last_queue_req}")
 
-        idle_time = time.time() - last_semaphore_release
-        low_queue = last_queue_req <= max(1, peak_running_req // 10)
-        should_release = (
-            server_ready
-            and semaphore.locked()
-            and current_slots < max_doc_concurrency
-            and idle_time > 10
-            and (low_queue or last_running_req == 0 or running_reqs_decreased)
-        )
+        if match := throughput_re.search(line):
+            prompt_tps = float(match.group(1))
+            gen_tps = float(match.group(2))
 
-        if should_release:
-            semaphore.release()
-            current_slots += 1
-            running_reqs_decreased = False
-            last_semaphore_release = time.time()
-            logger.info(
-                "Semaphore released (slots=%s, running=%s, queued=%s, peak=%s)",
-                current_slots,
-                last_running_req,
-                last_queue_req,
-                peak_running_req,
-            )
+        if match := kv_usage_re.search(line):
+            kv_usage = float(match.group(1))
 
-    async def read_stream(stream, level: int) -> None:
+        await maybe_adjust()
+
+    async def read_stream(stream) -> None:
         loop = asyncio.get_event_loop()
         while True:
             line = await loop.run_in_executor(None, stream.readline)
@@ -433,8 +623,8 @@ async def monitor_vllm_logs(
             except Exception as exc:
                 logger.error("Log monitor error: %s", exc)
 
-    stdout_task = asyncio.create_task(read_stream(process.stdout, logging.INFO))
-    stderr_task = asyncio.create_task(read_stream(process.stderr, logging.ERROR))
+    stdout_task = asyncio.create_task(read_stream(process.stdout))
+    stderr_task = asyncio.create_task(read_stream(process.stderr))
 
     try:
         await asyncio.to_thread(process.wait)
@@ -562,7 +752,7 @@ async def process_page(
     local_pdf: Path,
     completion_url: str,
     api_key: Optional[str],
-    request_semaphore: asyncio.Semaphore,
+    request_limiter: AdaptiveSemaphore,
     prompt_text: str,
 ) -> Dict[str, Any]:
     start = time.time()
@@ -577,7 +767,9 @@ async def process_page(
                 render_pdf_to_base64png,
                 str(local_pdf),
                 page_num,
-                cfg.target_longest_dim,
+                target_longest_dim=cfg.target_longest_dim,
+                min_render_dpi=cfg.min_render_dpi,
+                max_render_pixels=cfg.max_render_pixels,
             )
     except Exception as exc:
         error = f"render_failed: {exc}"
@@ -607,7 +799,7 @@ async def process_page(
         )
 
         try:
-            async with request_semaphore:
+            async with request_limiter:
                 status_code, response_body = await apost(completion_url, payload, api_key=api_key)
             body_text = response_body.decode("utf-8", errors="replace")
 
@@ -667,7 +859,7 @@ async def process_document(
     metrics: Metrics,
     completion_url: str,
     api_key: Optional[str],
-    request_semaphore: asyncio.Semaphore,
+    request_limiter: AdaptiveSemaphore,
     prompt_text: str,
 ) -> List[Dict[str, Any]]:
     local_pdf = ensure_pdf_local(entry.pdf_path, cfg.download_dir, logger)
@@ -716,23 +908,31 @@ async def process_document(
         pages = pages[: cfg.max_pages_per_doc]
 
     page_tasks: Dict[int, asyncio.Task[Dict[str, Any]]] = {}
+    page_concurrency = max(1, min(cfg.max_page_concurrency, len(pages)))
+    page_semaphore = asyncio.Semaphore(page_concurrency)
+
+    async def run_page_task(
+        page_num: int,
+        index: int,
+    ) -> Dict[str, Any]:
+        async with page_semaphore:
+            return await process_page(
+                entry=entry,
+                cfg=cfg,
+                model_name=model_name,
+                logger=logger,
+                page_num=page_num,
+                page_index=index,
+                local_pdf=local_pdf,
+                completion_url=completion_url,
+                api_key=api_key,
+                request_limiter=request_limiter,
+                prompt_text=prompt_text,
+            )
+
     async with asyncio.TaskGroup() as tg:
         for index, page_num in enumerate(pages, start=1):
-            page_tasks[page_num] = tg.create_task(
-                process_page(
-                    entry=entry,
-                    cfg=cfg,
-                    model_name=model_name,
-                    logger=logger,
-                    page_num=page_num,
-                    page_index=index,
-                    local_pdf=local_pdf,
-                    completion_url=completion_url,
-                    api_key=api_key,
-                    request_semaphore=request_semaphore,
-                    prompt_text=prompt_text,
-                )
-            )
+            page_tasks[page_num] = tg.create_task(run_page_task(page_num, index))
 
     results: List[Dict[str, Any]] = []
     for page_num in sorted(page_tasks.keys()):
@@ -769,8 +969,8 @@ async def run_batch(
     cfg: BatchConfig,
     model_name: str,
     base_url: str,
-    doc_semaphore: asyncio.Semaphore,
-    request_semaphore: asyncio.Semaphore,
+    doc_limiter: AdaptiveSemaphore,
+    request_limiter: AdaptiveSemaphore,
     logger: logging.Logger,
 ) -> None:
     metrics = Metrics()
@@ -778,8 +978,8 @@ async def run_batch(
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.errored_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.download_dir.mkdir(parents=True, exist_ok=True)
-    intermediate_success = Path("/data/page_results/success")
-    intermediate_errors = Path("/data/page_results/errors")
+    intermediate_success = Path("/data/train_page_results/success")
+    intermediate_errors = Path("/data/train_page_results/errors")
     shutil.rmtree(intermediate_success.parent, ignore_errors=True)
     intermediate_success.mkdir(parents=True, exist_ok=True)
     intermediate_errors.mkdir(parents=True, exist_ok=True)
@@ -819,48 +1019,46 @@ async def run_batch(
 
         async def worker(worker_id: int) -> None:
             while True:
-                await doc_semaphore.acquire()
                 entry = await queue.get()
                 if entry is None:
-                    doc_semaphore.release()
                     queue.task_done()
                     break
 
-                try:
-                    page_results = await process_document(
-                        entry=entry,
-                        cfg=cfg,
-                        model_name=model_name,
-                        logger=logger,
-                        metrics=metrics,
-                        completion_url=completion_url,
-                        api_key=api_key,
-                        request_semaphore=request_semaphore,
-                        prompt_text=prompt_text,
-                    )
-                except Exception as exc:
-                    logger.error("Worker %s failed processing %s: %s", worker_id, entry.document_id, exc)
-                    # Create an error record for the entire document
-                    page_results = [
-                        {
-                            "document_id": entry.document_id,
-                            "page": 0,
-                            "page_index": 0,
-                            "pdf_path": entry.pdf_path,
-                            "model": model_name,
-                            "success": False,
-                            "latency": 0.0,
-                            "usage": {},
-                            "content": None,
-                            "error": f"document_failed: {exc}",
-                        }
-                    ]
-                    # Record this as a failed "page" for metrics
-                    metrics.record(False, 0.0)
-                finally:
-                    doc_semaphore.release()
+                page_results: List[Dict[str, Any]] = []
 
                 try:
+                    async with doc_limiter:
+                        try:
+                            page_results = await process_document(
+                                entry=entry,
+                                cfg=cfg,
+                                model_name=model_name,
+                                logger=logger,
+                                metrics=metrics,
+                                completion_url=completion_url,
+                                api_key=api_key,
+                                request_limiter=request_limiter,
+                                prompt_text=prompt_text,
+                            )
+                        except Exception as exc:
+                            logger.error("Worker %s failed processing %s: %s", worker_id, entry.document_id, exc)
+                            # Create an error record for the entire document
+                            page_results = [
+                                {
+                                    "document_id": entry.document_id,
+                                    "page": 0,
+                                    "page_index": 0,
+                                    "pdf_path": entry.pdf_path,
+                                    "model": model_name,
+                                    "success": False,
+                                    "latency": 0.0,
+                                    "usage": {},
+                                    "content": None,
+                                    "error": f"document_failed: {exc}",
+                                }
+                            ]
+                            metrics.record(False, 0.0)
+
                     for page_result in page_results:
                         async with write_lock:
                             target_dir = intermediate_success if page_result["success"] else intermediate_errors
@@ -921,10 +1119,14 @@ def download_model(model_name: str, cache_dir: Path, logger: logging.Logger) -> 
     volumes={"/data": DATA_VOLUME, "/models": MODEL_VOLUME, "/root/.cache/vllm": VLLM_CACHE_VOLUME},
 )
 async def run_dots_batch(
-    manifest_path: str = "/data/manifest.jsonl",
-    output_path: str = "/data/dots_predictions.jsonl",
-    error_path: str = "/data/dots_errors.jsonl",
-    model_name: str = DEFAULT_MODEL,
+    manifest_path: str,
+    output_path: str,
+    error_path: str,
+    model_name: str,
+    download_dir: str,
+    log_path: str,
+    model_cache_dir: str,
+    vllm_port: int,
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: Optional[float] = None,
     max_model_len: int = 131072,
@@ -937,13 +1139,15 @@ async def run_dots_batch(
     batch_id: Optional[str] = None,
     prompt_mode: str = "layout-all",
     pdf_filenames: Optional[List[str]] = None,
+    max_page_concurrency: Optional[int] = None,
 ) -> Dict[str, Any]:
-    logger = setup_logging(Path("/data/dots_batch.log"))
+    logger = setup_logging(Path(log_path))
 
     cfg = BatchConfig(
         input_manifest=Path(manifest_path),
         output_path=Path(output_path),
         errored_path=Path(error_path),
+        download_dir=Path(download_dir),
         max_pages_per_doc=max_pages_per_doc,
         workers=workers,
         max_concurrent_docs=max_concurrent_docs or max(1, min(workers, 8)),
@@ -952,38 +1156,86 @@ async def run_dots_batch(
         max_retries=max_retries,
         batch_id=batch_id,
         prompt_mode=prompt_mode,
+        max_page_concurrency=max_page_concurrency or BatchConfig.__dataclass_fields__[
+            "max_page_concurrency"
+        ].default,
         target_pdf_filenames={extract_pdf_filename(name) for name in pdf_filenames}
         if pdf_filenames
         else None,
     )
 
-    logger.info("Starting DoTS.ocr batch with config: %s", cfg)
+    logger.info("Starting dots-ocr batch with config: %s", cfg)
 
-    model_cache_dir = Path("/models")
-    model_path = download_model(model_name, model_cache_dir, logger)
+    model_cache_root = Path(model_cache_dir)
+    model_path = download_model(model_name, model_cache_root, logger)
 
     doc_slots = max(1, min(cfg.max_concurrent_docs, cfg.workers))
-    doc_semaphore = asyncio.Semaphore(doc_slots)
-    request_semaphore = asyncio.Semaphore(max(1, cfg.max_inflight_requests))
+    cfg.max_page_concurrency = max(1, cfg.max_page_concurrency)
+
+    if cfg.initial_doc_concurrency is not None:
+        initial_doc_slots = cfg.initial_doc_concurrency
+    else:
+        if doc_slots <= 4:
+            initial_doc_slots = doc_slots
+        else:
+            initial_doc_slots = max(2, doc_slots // 2)
+    initial_doc_slots = max(1, min(doc_slots, initial_doc_slots))
+    doc_limiter = AdaptiveSemaphore(initial_doc_slots, min_limit=1, max_limit=doc_slots)
+    cfg.initial_doc_concurrency = doc_limiter.current_limit
+
+    max_requests = max(1, cfg.max_inflight_requests)
+    min_requests = cfg.min_inflight_requests if cfg.min_inflight_requests is not None else max(
+        4, doc_slots * cfg.max_page_concurrency
+    )
+    min_requests = max(1, min(min_requests, max_requests))
+
+    if cfg.initial_inflight_requests is not None:
+        initial_requests = cfg.initial_inflight_requests
+    else:
+        initial_requests = max(min_requests, int(max_requests * 0.6))
+    if initial_requests <= 0:
+        initial_requests = max_requests
+    initial_requests = max(min_requests, min(max_requests, initial_requests))
+
+    request_limiter = AdaptiveSemaphore(
+        initial_requests,
+        min_limit=min_requests,
+        max_limit=max_requests,
+    )
+    cfg.min_inflight_requests = min_requests
+    cfg.initial_inflight_requests = initial_requests
+
+    logger.info(
+        "Concurrency configuration: docs %s/%s, pages per doc %s, requests %s (min=%s max=%s)",
+        doc_limiter.current_limit,
+        doc_slots,
+        cfg.max_page_concurrency,
+        request_limiter.current_limit,
+        request_limiter.min_limit,
+        max_requests,
+    )
+
     server_process, monitor_task = launch_vllm_server(
         model_path=model_path,
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
-        semaphore=doc_semaphore,
-        max_doc_concurrency=doc_slots,
+        port=vllm_port,
+        doc_limiter=doc_limiter,
+        request_limiter=request_limiter,
+        page_concurrency=cfg.max_page_concurrency,
         logger=logger,
     )
 
     try:
-        base_url = f"http://localhost:{VLLM_PORT}"
+        base_url = f"http://localhost:{vllm_port}"
         await wait_for_vllm(base_url)
         await run_batch(
             cfg=cfg,
             model_name="dots-ocr",
             base_url=base_url,
-            doc_semaphore=doc_semaphore,
-            request_semaphore=request_semaphore,
+            doc_limiter=doc_limiter,
+            request_limiter=request_limiter,
             logger=logger,
         )
     finally:
@@ -1005,18 +1257,39 @@ async def run_dots_batch(
 
 @app.local_entrypoint()
 def main(
-    manifest: str = "/data/manifest.jsonl",
+    manifest: str,
+    output_path: str,
+    error_path: str,
+    model_name: str,
+    download_dir: str,
+    log_path: str,
+    model_cache_dir: str,
+    vllm_port: int,
     prompt_mode: str = "layout-all",
     workers: int = 4,
     max_concurrent_docs: Optional[int] = None,
     max_inflight_requests: Optional[int] = None,
+    max_page_concurrency: Optional[int] = None,
     pdf_filenames: Optional[str] = None,
 ) -> None:
-    kwargs = {"manifest_path": manifest, "workers": workers, "prompt_mode": prompt_mode}
+    kwargs = {
+        "manifest_path": manifest,
+        "output_path": output_path,
+        "error_path": error_path,
+        "model_name": model_name,
+        "download_dir": download_dir,
+        "log_path": log_path,
+        "model_cache_dir": model_cache_dir,
+        "vllm_port": vllm_port,
+        "workers": workers,
+        "prompt_mode": prompt_mode,
+    }
     if max_concurrent_docs is not None:
         kwargs["max_concurrent_docs"] = max_concurrent_docs
     if max_inflight_requests is not None:
         kwargs["max_inflight_requests"] = max_inflight_requests
+    if max_page_concurrency is not None:
+        kwargs["max_page_concurrency"] = max_page_concurrency
     if pdf_filenames:
         tokens = re.split(r"[,\s]+", pdf_filenames.strip())
         selected = [token for token in tokens if token]
