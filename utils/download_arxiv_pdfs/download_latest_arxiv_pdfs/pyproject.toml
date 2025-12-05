@@ -1,0 +1,9 @@
+[project]
+name = "download-arxiv-latest"
+version = "0.1.0"
+description = "Download latest version of all arxiv pdfs"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gsutil>=5.35",
+]
