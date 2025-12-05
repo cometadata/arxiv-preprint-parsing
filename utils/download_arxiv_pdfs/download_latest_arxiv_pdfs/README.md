@@ -41,6 +41,16 @@ uv run python download_latest_arxiv_pdfs.py -d ./pdfs/
 uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -p 16  # custom parallelism
 ```
 
+### Resume and batch downloads
+
+For large downloads, use batching with resume to download incrementally:
+
+```bash
+uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -r -b 10000  # download 10k files
+uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -r -b 10000  # resume, download next 10k
+uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -r           # resume until complete
+```
+
 ### Options
 
 | Option | Description |
@@ -48,6 +58,8 @@ uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -p 16  # custom paralleli
 | `-m, --manifest FILE` | Generate TSV manifest (use `-` for stdout) |
 | `-d, --download DIR` | Download PDFs to directory |
 | `-p, --parallel N` | Number of parallel downloads (default: 8) |
+| `-r, --resume` | Skip files that already exist |
+| `-b, --batch N` | Download only N files per run |
 
 ### Using the manifest manually
 

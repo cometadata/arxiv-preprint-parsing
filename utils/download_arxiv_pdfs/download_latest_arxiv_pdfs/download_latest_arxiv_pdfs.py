@@ -151,10 +151,30 @@ def find_latest_versions(pdf_paths: Iterator[str]) -> dict[str, tuple[str, int, 
 def download_files(
     latest_versions: dict[str, tuple[str, int, str]],
     output_dir: str,
-    parallel: int = 8
+    parallel: int = 8,
+    resume: bool = False,
+    batch_size: int | None = None
 ) -> None:
     items = list(latest_versions.items())
+
+    if resume:
+        original_count = len(items)
+        items = [
+            (pid, data) for pid, data in items
+            if not os.path.exists(os.path.join(output_dir, data[2]))
+        ]
+        skipped = original_count - len(items)
+        if skipped > 0:
+            print(f"  Resuming: skipped {skipped} already downloaded", file=sys.stderr)
+
+    if batch_size and len(items) > batch_size:
+        print(f"  Batch: downloading {batch_size} of {len(items)} remaining", file=sys.stderr)
+        items = items[:batch_size]
+
     total = len(items)
+    if total == 0:
+        print("Nothing to download", file=sys.stderr)
+        return
 
     def download_one(item: tuple[str, tuple[str, int, str]]) -> tuple[str, bool, str]:
         paper_id, (gcs_path, version, local_path) = item
@@ -217,6 +237,17 @@ def main():
         default=8,
         help='Number of parallel downloads (default: 8)'
     )
+    parser.add_argument(
+        '-r', '--resume',
+        action='store_true',
+        help='Skip files that already exist in output directory'
+    )
+    parser.add_argument(
+        '-b', '--batch',
+        type=int,
+        metavar='N',
+        help='Download only N files per run (use with --resume for incremental downloads)'
+    )
     args = parser.parse_args()
 
     print("Discovering PDF directories...", file=sys.stderr)
@@ -234,7 +265,13 @@ def main():
     if args.download:
         print(f"Downloading to {args.download}...", file=sys.stderr)
         os.makedirs(args.download, exist_ok=True)
-        download_files(latest_versions, args.download, args.parallel)
+        download_files(
+            latest_versions,
+            args.download,
+            args.parallel,
+            args.resume,
+            args.batch
+        )
     else:
         output = sys.stdout if args.manifest == '-' else open(args.manifest, 'w')
         try:
