@@ -148,27 +148,41 @@ def find_latest_versions(pdf_paths: Iterator[str]) -> dict[str, tuple[str, int, 
     return latest_versions
 
 
-def download_files(
-    latest_versions: dict[str, tuple[str, int, str]],
+def load_manifest(manifest_path: str) -> dict[str, tuple[str, str]]:
+    manifest = {}
+    with open(manifest_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('\t')
+            if len(parts) == 2:
+                gcs_path, local_path = parts
+                manifest[gcs_path] = local_path
+    return manifest
+
+
+def download_from_manifest(
+    manifest: dict[str, str],
     output_dir: str,
     parallel: int = 8,
     resume: bool = False,
     batch_size: int | None = None
 ) -> None:
-    items = list(latest_versions.items())
+
+    items = list(manifest.items())
 
     if resume:
-        original_count = len(items)
         items = [
-            (pid, data) for pid, data in items
-            if not os.path.exists(os.path.join(output_dir, data[2]))
+            (gcs_path, local_path) for gcs_path, local_path in items
+            if not os.path.exists(os.path.join(output_dir, local_path))
         ]
-        skipped = original_count - len(items)
+        skipped = len(manifest) - len(items)
         if skipped > 0:
-            print(f"  Resuming: skipped {skipped} already downloaded", file=sys.stderr)
+            print(f"Skipping {skipped} already downloaded", file=sys.stderr)
 
     if batch_size and len(items) > batch_size:
-        print(f"  Batch: downloading {batch_size} of {len(items)} remaining", file=sys.stderr)
+        print(f"Batch: downloading {batch_size} of {len(items)} remaining", file=sys.stderr)
         items = items[:batch_size]
 
     total = len(items)
@@ -176,8 +190,8 @@ def download_files(
         print("Nothing to download", file=sys.stderr)
         return
 
-    def download_one(item: tuple[str, tuple[str, int, str]]) -> tuple[str, bool, str]:
-        paper_id, (gcs_path, version, local_path) = item
+    def download_one(item: tuple[str, str]) -> tuple[str, bool, str]:
+        gcs_path, local_path = item
         dest_path = os.path.join(output_dir, local_path)
         dest_dir = os.path.dirname(dest_path)
 
@@ -191,10 +205,10 @@ def download_files(
                 text=True
             )
             if result.returncode != 0:
-                return paper_id, False, result.stderr
-            return paper_id, True, ""
+                return gcs_path, False, result.stderr
+            return gcs_path, True, ""
         except Exception as e:
-            return paper_id, False, str(e)
+            return gcs_path, False, str(e)
 
     completed = 0
     failed = 0
@@ -204,14 +218,14 @@ def download_files(
 
         for future in concurrent.futures.as_completed(futures):
             completed += 1
-            paper_id, success, error = future.result()
+            gcs_path, success, error = future.result()
 
             if not success:
                 failed += 1
-                print(f"  Failed: {paper_id}: {error}", file=sys.stderr)
+                print(f"Failed: {gcs_path}: {error}", file=sys.stderr)
 
             if completed % 100 == 0 or completed == total:
-                print(f"  Downloaded {completed}/{total} ({failed} failed)...", file=sys.stderr)
+                print(f"Downloaded {completed}/{total} ({failed} failed)...", file=sys.stderr)
 
     print(f"Download complete: {completed - failed} succeeded, {failed} failed", file=sys.stderr)
 
@@ -220,60 +234,66 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate manifest of latest arXiv PDFs or download them"
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        '-m', '--manifest',
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    manifest_parser = subparsers.add_parser(
+        'manifest',
+        help='Generate TSV manifest file (discovers all PDFs from server)'
+    )
+    manifest_parser.add_argument(
+        'output',
         metavar='FILE',
-        help='Generate TSV manifest file (use - for stdout)'
+        help='Output manifest file (use - for stdout)'
     )
-    group.add_argument(
-        '-d', '--download',
+
+    download_parser = subparsers.add_parser(
+        'download',
+        help='Download PDFs using a manifest file'
+    )
+    download_parser.add_argument(
+        'manifest',
+        metavar='MANIFEST',
+        help='Input manifest file (TSV: gcs_path, local_path)'
+    )
+    download_parser.add_argument(
+        'output_dir',
         metavar='DIR',
-        help='Download PDFs to specified directory'
+        help='Output directory for downloaded PDFs'
     )
-    parser.add_argument(
+    download_parser.add_argument(
         '-p', '--parallel',
         type=int,
         default=8,
         help='Number of parallel downloads (default: 8)'
     )
-    parser.add_argument(
+    download_parser.add_argument(
         '-r', '--resume',
         action='store_true',
         help='Skip files that already exist in output directory'
     )
-    parser.add_argument(
+    download_parser.add_argument(
         '-b', '--batch',
         type=int,
         metavar='N',
         help='Download only N files per run (use with --resume for incremental downloads)'
     )
+
     args = parser.parse_args()
 
-    print("Discovering PDF directories...", file=sys.stderr)
-    directories = list_pdf_directories()
-    print(f"Found {len(directories)} directories to scan", file=sys.stderr)
+    if args.command == 'manifest':
+        print("Discovering PDF directories...", file=sys.stderr)
+        directories = list_pdf_directories()
+        print(f"Found {len(directories)} directories to scan", file=sys.stderr)
 
-    print("Enumerating PDFs (this may take 10-30 minutes)...", file=sys.stderr)
-    pdf_paths = enumerate_all_pdfs(directories)
+        print("Enumerating PDFs (this may take 10-30 minutes)...", file=sys.stderr)
+        pdf_paths = enumerate_all_pdfs(directories)
 
-    print("Finding latest versions...", file=sys.stderr)
-    latest_versions = find_latest_versions(pdf_paths)
+        print("Finding latest versions...", file=sys.stderr)
+        latest_versions = find_latest_versions(pdf_paths)
 
-    print(f"Found {len(latest_versions)} unique PDFs (latest versions only)", file=sys.stderr)
+        print(f"Found {len(latest_versions)} unique PDFs (latest versions only)", file=sys.stderr)
 
-    if args.download:
-        print(f"Downloading to {args.download}...", file=sys.stderr)
-        os.makedirs(args.download, exist_ok=True)
-        download_files(
-            latest_versions,
-            args.download,
-            args.parallel,
-            args.resume,
-            args.batch
-        )
-    else:
-        output = sys.stdout if args.manifest == '-' else open(args.manifest, 'w')
+        output = sys.stdout if args.output == '-' else open(args.output, 'w')
         try:
             for paper_id in sorted(latest_versions.keys()):
                 gcs_path, version, local_path = latest_versions[paper_id]
@@ -281,6 +301,23 @@ def main():
         finally:
             if output is not sys.stdout:
                 output.close()
+
+        if args.output != '-':
+            print(f"Manifest written to {args.output}", file=sys.stderr)
+
+    elif args.command == 'download':
+        print(f"Loading manifest from {args.manifest}...", file=sys.stderr)
+        manifest = load_manifest(args.manifest)
+        print(f"Manifest contains {len(manifest)} files", file=sys.stderr)
+
+        os.makedirs(args.output_dir, exist_ok=True)
+        download_from_manifest(
+            manifest,
+            args.output_dir,
+            args.parallel,
+            args.resume,
+            args.batch
+        )
 
 
 if __name__ == '__main__':
