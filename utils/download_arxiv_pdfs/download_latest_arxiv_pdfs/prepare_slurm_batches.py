@@ -3,6 +3,8 @@ import sys
 import argparse
 import math
 from pathlib import Path
+from tqdm import tqdm
+from glob import glob
 
 
 SLURM_TEMPLATE = '''#!/bin/bash
@@ -75,17 +77,25 @@ def load_manifest(manifest_path: str) -> list[tuple[str, str]]:
                 items.append((parts[0], parts[1]))
     return items
 
-
 def filter_existing(
     items: list[tuple[str, str]],
     output_dir: str
 ) -> list[tuple[str, str]]:
+    existing = set()
+    for root, _, files in os.walk(output_dir):
+        for fname in tqdm(files, desc="walking output"):
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, output_dir)
+            existing.add(rel)
+
+    # filter remaining
     remaining = []
-    for gcs_path, local_path in items:
-        dest_path = os.path.join(output_dir, local_path)
-        if not os.path.exists(dest_path):
+    for gcs_path, local_path in tqdm(items, desc="filtering"):
+        if local_path not in existing:
             remaining.append((gcs_path, local_path))
+
     return remaining
+
 
 
 def split_into_batches(

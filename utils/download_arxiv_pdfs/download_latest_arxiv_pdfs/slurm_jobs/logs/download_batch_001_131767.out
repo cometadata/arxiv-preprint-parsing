@@ -1,0 +1,13 @@
+=========================================
+Job ID: 131767
+Job Name: arxiv-dl-001
+Batch Index: 1
+Node: n01
+Start Time: Thu Dec 11 03:06:06 PM PST 2025
+=========================================
+
+Conda environment: comet-inference
+Python: /users/psarin/.conda/envs/comet-inference/bin/python
+Working directory: /scratch/m000152-pm04/arxiv-preprint-parsing/utils/download_arxiv_pdfs/download_latest_arxiv_pdfs
+
+Starting download for batch 1...
