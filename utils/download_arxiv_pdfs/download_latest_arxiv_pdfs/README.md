@@ -17,13 +17,13 @@ uv sync
 
 ## Usage
 
-### Generate manifest
+### 1. Generate manifest
 
-Output a TSV file with the Kaggle GCS source paths and local filenames:
+First, generate a TSV manifest of all PDFs to download:
 
 ```bash
-uv run python download_latest_arxiv_pdfs.py -m manifest.tsv
-uv run python download_latest_arxiv_pdfs.py -m -  # stdout
+python download_latest_arxiv_pdfs.py manifest output.tsv
+python download_latest_arxiv_pdfs.py manifest -  # stdout
 ```
 
 Manifest format:
@@ -32,42 +32,96 @@ gs://arxiv-dataset/arxiv/pdf/2411/2411.00003v4.pdf	2411.00003v4.pdf
 gs://arxiv-dataset/arxiv/hep-th/pdf/9201/9201001v1.pdf	hep-th_9201001v1.pdf
 ```
 
-### Download directly
+### 2. Download using manifest
 
-Download all PDFs to a directory:
+Download PDFs from a manifest file:
 
 ```bash
-uv run python download_latest_arxiv_pdfs.py -d ./pdfs/
-uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -p 16  # custom parallelism
+python download_latest_arxiv_pdfs.py download manifest.tsv ./pdfs/
+python download_latest_arxiv_pdfs.py download manifest.tsv ./pdfs/ -p 16  # 16 parallel downloads
 ```
 
-### Resume and batch downloads
+#### Resume and batch downloads
 
-For large downloads, use batching with resume to download incrementally:
+For large downloads, use batching with resume:
 
 ```bash
-uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -r -b 10000  # download 10k files
-uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -r -b 10000  # resume, download next 10k
-uv run python download_latest_arxiv_pdfs.py -d ./pdfs/ -r           # resume until complete
+python download_latest_arxiv_pdfs.py download manifest.tsv ./pdfs/ -r -b 10000  # download 10k
+python download_latest_arxiv_pdfs.py download manifest.tsv ./pdfs/ -r -b 10000  # next 10k
+python download_latest_arxiv_pdfs.py download manifest.tsv ./pdfs/ -r           # until complete
 ```
 
 ### Options
 
-| Option | Description |
-|--------|-------------|
-| `-m, --manifest FILE` | Generate TSV manifest (use `-` for stdout) |
-| `-d, --download DIR` | Download PDFs to directory |
+**manifest command:**
+| Argument | Description |
+|----------|-------------|
+| `FILE` | Output manifest file (use `-` for stdout) |
+
+**download command:**
+| Argument | Description |
+|----------|-------------|
+| `MANIFEST` | Input manifest file |
+| `DIR` | Output directory for PDFs |
 | `-p, --parallel N` | Number of parallel downloads (default: 8) |
 | `-r, --resume` | Skip files that already exist |
 | `-b, --batch N` | Download only N files per run |
 
-### Using the manifest manually
+
+## SLURM Batch Downloads
+
+For cluster environments, use the SLURM batch scripts to parallelize downloads across jobs.
+
+### 1. Prepare batches
 
 ```bash
-while IFS=$'\t' read -r src dest; do
-    gsutil cp "$src" "./pdfs/$dest"
-done < manifest.tsv
+# Split into batches of 10,000 files each
+python prepare_slurm_batches.py manifest.tsv ./pdfs/ --batch-size 10000
+
+# Or specify number of batches
+python prepare_slurm_batches.py manifest.tsv ./pdfs/ --batches 25
+
+# Preview without writing files
+python prepare_slurm_batches.py manifest.tsv ./pdfs/ --batch-size 10000 --dry-run
 ```
+
+This creates:
+```
+slurm_jobs/
+├── batches/
+│   ├── batch_001.txt
+│   ├── batch_002.txt
+│   └── ...
+├── jobs/
+│   ├── download_batch_001.sbatch
+│   ├── download_batch_002.sbatch
+│   └── ...
+├── logs/
+└── submit_all.sh
+```
+
+### 2. Submit jobs
+
+```bash
+# Submit all jobs to queue
+./slurm_jobs/submit_all.sh
+
+# Or submit individually
+sbatch slurm_jobs/jobs/download_batch_001.sbatch
+```
+
+### SLURM options
+
+| Option | Description |
+|--------|-------------|
+| `--batch-size N` | Files per batch |
+| `--batches N` | Number of batches (alternative to --batch-size) |
+| `--slurm-dir DIR` | Output directory for SLURM files (default: ./slurm_jobs) |
+| `--cpus N` | CPUs per task / parallel downloads (default: 8) |
+| `--conda-env NAME` | Conda environment to activate (default: comet-inference) |
+| `--work-dir DIR` | Working directory for jobs (default: current directory) |
+| `--dry-run` | Preview without writing files |
+
 
 ## Filename Format
 
@@ -76,4 +130,4 @@ done < manifest.tsv
 | New (2007+) | `2411.00003` | `.../pdf/2411/2411.00003v4.pdf` | `2411.00003v4.pdf` |
 | Legacy | `hep-th/9201001` | `.../hep-th/pdf/9201/9201001v1.pdf` | `hep-th_9201001v1.pdf` |
 
-Legacy papers include the subject prefix in the filename to avoid collisions (e.g., `hep-th_9201002v1.pdf` and `hep-lat_9201002v1.pdf` are different papers).
+Legacy papers include the subject prefix in the filename to avoid collisions.
